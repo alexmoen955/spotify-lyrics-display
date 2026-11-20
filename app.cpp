@@ -415,57 +415,44 @@ static void deriveArt(ArtSet& s) {
 String g_accessToken, g_refreshToken;
 uint32_t g_tokenExpires = 0;
 
-static bool httpGetBinary(const String& url, uint8_t** out, size_t* outLen) {
+// Download a URL straight into a LittleFS file. HTTPClient::writeToStream handles
+// Content-Length, chunked encoding and "read until close" correctly, and only needs
+// a small buffer, so this works even while TLS uses most of the RAM.
+static int httpGetToFile(const String& url, const char* path, int* bytes, const char* tag) {
+  *bytes = 0;
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
-  http.useHTTP10(true);
-  http.setTimeout(10000);
-  if (!http.begin(client, url)) return false;
+  http.setReuse(false);
+  http.setTimeout(12000);
+  http.setUserAgent(USER_AGENT);
+  if (!http.begin(client, url)) return -1;
   int code = http.GET();
-  if (code != 200) { http.end(); return false; }
-  int size = http.getSize();
-  if (size > (int)MAX_JPG) { http.end(); return false; }
-  // While TLS is open there isn't enough RAM for the image, so stream it to flash first.
-  File f = LittleFS.open("/art.jpg", "w");
-  if (!f) { http.end(); Serial.println("art: can't open flash file"); return false; }
-  auto* stream = http.getStreamPtr();
-  uint8_t chunk[1024];
-  size_t got = 0;
-  uint32_t last = millis();
-  while (got < MAX_JPG && millis() - last < 8000) {
-    if (size > 0 && got >= (size_t)size) break;
-    size_t avail = stream->available();
-    if (avail) {
-      size_t n = stream->readBytes(chunk, min(avail, sizeof(chunk)));
-      f.write(chunk, n);
-      got += n;
-      last = millis();
-    } else if (!stream->connected()) {
-      break;
+  if (code == 200) {
+    File f = LittleFS.open(path, "w");
+    if (!f) {
+      Serial.printf("%s: can't open %s\n", tag, path);
+      code = -10;
     } else {
-      delay(2);
+      int n = http.writeToStream(&f);
+      f.close();
+      if (n < 0) { Serial.printf("%s: download error %d\n", tag, n); code = -11; }
+      else *bytes = n;
     }
+  } else if (code < 0) {
+    char err[100] = "";
+    client.lastError(err, sizeof(err));
+    Serial.printf("%s: HTTP %d %s (heap %u, largest %u)\n", tag, code, err, (unsigned)ESP.getFreeHeap(),
+                  (unsigned)ESP.getMaxAllocHeap());
   }
-  f.close();
   http.end();   // TLS memory is freed here
-  if (got == 0 || (size > 0 && got != (size_t)size)) return false;
-  uint8_t* buf = (uint8_t*)malloc(got);
-  if (!buf) { Serial.println("art: out of memory"); return false; }
-  File r = LittleFS.open("/art.jpg", "r");
-  size_t rd = r ? r.read(buf, got) : 0;
-  if (r) r.close();
-  if (rd != got) { free(buf); return false; }
-  *out = buf;
-  *outLen = got;
-  return true;
+  return code;
 }
 
-// Decode into the single shared art buffer. Caller holds the lock.
-static bool decodeArt(uint8_t* jpg, size_t len, ArtSet& dst) {
+// Decode /art.jpg from flash into the shared art buffer. Caller holds the lock.
+static bool decodeArtFile(ArtSet& dst) {
   uint16_t w = 0, h = 0;
-  TJpgDec.getJpgSize(&w, &h, jpg, len);
-  if (w == 0 || h == 0) return false;
+  if (TJpgDec.getFsJpgSize(&w, &h, "/art.jpg", LittleFS) != JDR_OK || w == 0 || h == 0) return false;
   int scale = 1;
   const int scales[] = { 8, 4, 2 };
   for (int sc : scales) if (w / sc >= ART && h / sc >= ART) { scale = sc; break; }
@@ -473,21 +460,26 @@ static bool decodeArt(uint8_t* jpg, size_t len, ArtSet& dst) {
   memset(dst.art, 0, ART * ART * 2);
   g_decodeTarget = dst.art;
   int ox = ((int)(w / scale) - ART) / 2, oy = ((int)(h / scale) - ART) / 2;  // centre crop
-  JRESULT r = TJpgDec.drawJpg(-ox, -oy, jpg, len);
+  JRESULT r = TJpgDec.drawFsJpg(-ox, -oy, "/art.jpg", LittleFS);
   if (r != JDR_OK) { Serial.printf("art: jpeg decode failed (%d)\n", (int)r); return false; }
   deriveArt(dst);
   return true;
 }
 
-// Download outside the lock (slow), then decode under the lock (~100 ms).
+// Download outside the lock (slow), then decode under the lock (~200 ms).
 static void fetchArt(const String& url) {
-  uint8_t* jpg = nullptr;
-  size_t len = 0;
-  bool ok = url.length() && httpGetBinary(url, &jpg, &len);
+  uint32_t t0 = millis();
+  int bytes = 0;
+  bool ok = false;
+  if (url.length() == 0) Serial.println("art: no image url");
+  else ok = httpGetToFile(url, "/art.jpg", &bytes, "art") == 200 && bytes > 0;
+  uint32_t t1 = millis();
   lock();
-  if (!ok || !decodeArt(jpg, len, g_art[0])) deriveDefault(g_art[0]);
+  bool dec = ok && decodeArtFile(g_art[0]);
+  if (!dec) deriveDefault(g_art[0]);
   unlock();
-  free(jpg);
+  Serial.printf("art: %s, %d bytes, download %ums, decode %ums\n", dec ? "OK" : "FAILED", bytes,
+                (unsigned)(t1 - t0), (unsigned)(millis() - t1));
 }
 
 static bool refreshAccessToken(int* httpCode) {
@@ -549,19 +541,15 @@ static bool ensureToken() {
 
 // --- LRCLIB ---
 static int lrclibGet(const String& url, JsonDocument& doc, JsonDocument& filter) {
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.useHTTP10(true);
-  http.setTimeout(12000);
-  http.setUserAgent(USER_AGENT);
-  if (!http.begin(client, url)) return -1;
-  int code = http.GET();
+  int bytes = 0;
+  int code = httpGetToFile(url, "/lrc.json", &bytes, "lyrics");
   if (code == 200) {
-    DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
-    if (err) { Serial.printf("lrclib json: %s\n", err.c_str()); code = -2; }
+    File f = LittleFS.open("/lrc.json", "r");
+    DeserializationError err = f ? deserializeJson(doc, f, DeserializationOption::Filter(filter))
+                                 : DeserializationError(DeserializationError::InvalidInput);
+    if (f) f.close();
+    if (err) { Serial.printf("lyrics: json %s (%d bytes)\n", err.c_str(), bytes); code = -2; }
   }
-  http.end();
   return code;
 }
 
@@ -644,8 +632,11 @@ static void pollSpotify(uint32_t& backoffUntil) {
     return;
   }
   if (code != 200) {
+    char err[100] = "";
+    client.lastError(err, sizeof(err));
     http.end();
-    Serial.printf("currently-playing HTTP %d\n", code);
+    Serial.printf("poll: HTTP %d %s (heap %u, largest %u)\n", code, err, (unsigned)ESP.getFreeHeap(),
+                  (unsigned)ESP.getMaxAllocHeap());
     backoffUntil = millis() + 5000;
     return;
   }
@@ -726,7 +717,8 @@ static void pollSpotify(uint32_t& backoffUntil) {
   unlock();
 
   if (!changed) return;
-  Serial.printf("Now playing: %s - %s\n", artists.c_str(), title.c_str());
+  Serial.printf("Now playing: %s - %s  (detected %.1fs into the song)\n", artists.c_str(), title.c_str(),
+                progress / 1000.0f);
 
   // album art -> back buffer, then swap
   fetchArt(artUrl);
@@ -1262,12 +1254,16 @@ void setup() {
   WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   uint32_t start = millis(), last = millis();
+  int attempts = 1;
   while (WiFi.status() != WL_CONNECTED) {
     uint32_t now = millis();
     renderFrame(now, now - last);
     last = now;
-    if (now - start > 20000) {
-      strlcpy(g_status, "WiFi failed. Check name/password in config.h (2.4 GHz only)", sizeof(g_status));
+    // The first attempt after power-up often fails silently: retry quickly.
+    if (now - start > 8000) {
+      if (++attempts > 3)
+        strlcpy(g_status, "WiFi failed. Check name/password in config.h (2.4 GHz only)", sizeof(g_status));
+      Serial.printf("WiFi retry %d\n", attempts);
       start = now;
       WiFi.disconnect();
       WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
