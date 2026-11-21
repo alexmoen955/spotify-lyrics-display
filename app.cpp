@@ -17,6 +17,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiMulti.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
@@ -110,6 +111,8 @@ class ClipCanvas : public GFXcanvas16 {
  private:
   int16_t cx0, cy0, cx1, cy1;
 };
+
+WiFiMulti wifiMulti;   // the known networks (WIFI_LIST) are in config.h
 
 Adafruit_ST7735 tft(TFT_CS, TFT_DC, TFT_RST);
 ClipCanvas canvas(W, H);
@@ -740,10 +743,23 @@ static void netTask(void*) {
   uint32_t lastPoll = 0, backoffUntil = 0;
   for (;;) {
     if (WiFi.status() != WL_CONNECTED) {
-      setStatus("WiFi lost. Reconnecting...");
+      static bool everConnected = false;
+      static int fails = 0;
+      if (fails < 3) setStatus(everConnected ? "WiFi lost. Reconnecting..." : "Looking for WiFi...");
       lock(); g_statusMode = true; unlock();
-      WiFi.reconnect();
-      for (int i = 0; i < 40 && WiFi.status() != WL_CONNECTED; i++) vTaskDelay(pdMS_TO_TICKS(250));
+      // scans, then joins the strongest network from config.h
+      if (wifiMulti.run(10000) == WL_CONNECTED) {
+        Serial.printf("WiFi OK: %s, IP %s, signal %d dBm\n", WiFi.SSID().c_str(),
+                      WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
+        if (!everConnected) configTzTime(TIMEZONE, "pool.ntp.org", "time.google.com");
+        everConnected = true;
+        fails = 0;
+        setStatus("Talking to Spotify...");
+        g_forcePoll = true;
+      } else if (++fails >= 3) {
+        setStatus("No known WiFi found. Check config.h (2.4 GHz only)");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+      }
       continue;
     }
     uint32_t now = millis();
@@ -1248,37 +1264,19 @@ void setup() {
   }
   g_refreshToken = prefs.getString("rt", SPOTIFY_REFRESH_TOKEN);
 
-  // WiFi
-  snprintf(g_status, sizeof(g_status), "Connecting to %s", WIFI_SSID);
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  uint32_t start = millis(), last = millis();
-  int attempts = 1;
-  while (WiFi.status() != WL_CONNECTED) {
-    uint32_t now = millis();
-    renderFrame(now, now - last);
-    last = now;
-    // The first attempt after power-up often fails silently: retry quickly.
-    if (now - start > 8000) {
-      if (++attempts > 3)
-        strlcpy(g_status, "WiFi failed. Check name/password in config.h (2.4 GHz only)", sizeof(g_status));
-      Serial.printf("WiFi retry %d\n", attempts);
-      start = now;
-      WiFi.disconnect();
-      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    }
-    delay(FRAME_MS);
-  }
-  Serial.print("WiFi OK, IP ");
-  Serial.println(WiFi.localIP());
-  configTzTime(TIMEZONE, "pool.ntp.org", "time.google.com");
-
   if (strlen(SPOTIFY_CLIENT_ID) == 0 || strlen(SPOTIFY_CLIENT_SECRET) == 0 || g_refreshToken.length() == 0) {
     strlcpy(g_status, "Add your Spotify keys to config.h (see README.md)", sizeof(g_status));
     for (;;) { uint32_t now = millis(); renderFrame(now, FRAME_MS); delay(FRAME_MS); }
   }
-  strlcpy(g_status, "Talking to Spotify...", sizeof(g_status));
+
+  // WiFi: register every known network; the network task connects to the strongest one
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  for (const WifiNet& n : WIFI_LIST) {
+    wifiMulti.addAP(n.ssid, n.pass);
+    Serial.printf("Known WiFi: %s\n", n.ssid);
+  }
+  strlcpy(g_status, "Looking for WiFi...", sizeof(g_status));
   xTaskCreatePinnedToCore(netTask, "net", 16384, nullptr, 1, nullptr, 0);
 }
 

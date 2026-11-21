@@ -34,7 +34,17 @@ Unplug the ESP32 from USB first.
 
 ## 3. Test the screen
 
-Open `SpotifyLyricsDisplay.ino` and set your WiFi in `config.h`. Leave the Spotify fields empty for now. Then set:
+Open `SpotifyLyricsDisplay.ino` and set your WiFi in `config.h`. Leave the Spotify fields empty for now. You can list several networks: the display joins the strongest one it knows and switches automatically if it drops (2.4 GHz only):
+
+```c
+struct WifiNet { const char* ssid; const char* pass; };
+static const WifiNet WIFI_LIST[] = {
+  { "home-wifi",     "password" },
+  { "phone-hotspot", "password" },
+};
+```
+
+Then set:
 
 - **Tools → Board**: ESP32 Dev Module
 - **Tools → Partition Scheme**: **Huge APP (3MB No OTA/1MB SPIFFS)**. The default scheme is too small for this sketch.
