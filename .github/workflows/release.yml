@@ -1,0 +1,59 @@
+# Builds the firmware when a version tag (v1.2.3) is pushed and attaches it to
+# the GitHub release as firmware.bin. The display downloads that file when you
+# click "Install update" on its web page.
+name: Build firmware
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: SpotifyLyricsDisplay   # Arduino wants the folder named like the .ino
+
+      - uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 core and libraries
+        run: |
+          URL=https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index --additional-urls "$URL"
+          arduino-cli core install esp32:esp32@4.0.0 --additional-urls "$URL"
+          arduino-cli lib install \
+            "Adafruit ST7735 and ST7789 Library@1.12.0" "Adafruit GFX Library@1.13.0" "Adafruit BusIO@1.17.4" \
+            "U8g2_for_Adafruit_GFX@1.8.0" "ArduinoJson@7.4.3" "TJpg_Decoder@1.1.0"
+
+      - name: Stamp the version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: echo "#define FW_VERSION \"${GITHUB_REF_NAME}\"" > SpotifyLyricsDisplay/version.h
+
+      - name: Build
+        run: |
+          arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs \
+            --output-dir build SpotifyLyricsDisplay
+          cp build/SpotifyLyricsDisplay.ino.bin firmware.bin
+          # must fit one app slot of partitions.csv (0x1A0000)
+          size=$(stat -c%s firmware.bin); echo "firmware.bin: $size bytes"
+          test "$size" -lt 1703936
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd SpotifyLyricsDisplay
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" ../firmware.bin --clobber
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: firmware.bin

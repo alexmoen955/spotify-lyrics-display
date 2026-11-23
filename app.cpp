@@ -20,9 +20,11 @@
 #include <WiFiMulti.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
-#include <Preferences.h>
+#include <HTTPUpdate.h>
 #include <LittleFS.h>
-#include <base64.h>
+#include <SHA2Builder.h>
+#include <esp_random.h>
+#include "qrcode.h"
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7735.h>
@@ -33,6 +35,10 @@
 #include <algorithm>
 #include <time.h>
 #include "config.h"
+#include "version.h"
+#include "logger.h"
+#include "settings.h"
+#include "device.h"
 
 // ---------------------------------------------------------------- constants --
 static const int W = 128, H = 128;
@@ -46,7 +52,7 @@ static const int MAX_ROWS = 4;       // max wrapped rows per lyric line
 static const int LINE_GAP = 5;
 static const uint32_t FRAME_MS = 33;
 static const size_t MAX_JPG = 120 * 1024;
-static const char* USER_AGENT = "SpotifyLyricsDisplay/1.0 (ESP32)";
+static const char* USER_AGENT = "SpotifyLyricsDisplay/" FW_VERSION " (ESP32)";
 
 #define FONT_TITLE  u8g2_font_helvB08_tf
 #define FONT_SUB    u8g2_font_helvR08_tf
@@ -112,12 +118,11 @@ class ClipCanvas : public GFXcanvas16 {
   int16_t cx0, cy0, cx1, cy1;
 };
 
-WiFiMulti wifiMulti;   // the known networks (WIFI_LIST) are in config.h
+WiFiMulti* g_wifiMulti = nullptr;   // rebuilt from the saved networks (settings.h)
 
 Adafruit_ST7735 tft(TFT_CS, TFT_DC, TFT_RST);
 ClipCanvas canvas(W, H);
 U8G2_FOR_ADAFRUIT_GFX u8f;
-Preferences prefs;
 
 // ------------------------------------------------------------ shared state --
 // Written by the network task (core 0), read by the render loop (core 1).
@@ -133,7 +138,6 @@ struct TrackInfo {
 enum LyricsState : uint8_t { LYR_NONE, LYR_LOADING, LYR_SYNCED, LYR_NOT_FOUND, LYR_INSTRUMENTAL };
 struct LyricLine { uint32_t t; String text; };
 struct ArtSet {
-  uint16_t* art = nullptr;   // ART*ART pixels
   bool has = false;
   uint16_t thumb[THUMB * THUMB];
   RGB grid[GRID * GRID];     // darkened colour grid for the background
@@ -151,6 +155,36 @@ bool g_statusMode = true;
 char g_status[96] = "Starting...";
 uint32_t g_lastActiveMs = 0;
 volatile bool g_forcePoll = false;
+uint32_t g_artVersion = 0;
+
+// --- Wi-Fi / setup hotspot (written by the network task) ---
+volatile bool g_wifiUp = false;
+volatile bool g_hotspot = false;
+volatile bool g_setupDone = false;
+volatile bool g_wifiListChanged = false;
+uint32_t g_hotspotOffAt = 0;
+char g_ipStr[20] = "";
+std::vector<String> g_savedSsids;
+enum TryState : uint8_t { TRY_IDLE, TRY_TRYING, TRY_OK, TRY_FAIL };
+volatile bool g_tryPending = false;
+TryState g_tryState = TRY_IDLE;
+String g_trySsid, g_tryPass, g_tryMsg;
+
+// --- Spotify login (PKCE: no client secret needed) ---
+enum SpState : uint8_t { SP_NEEDS_CLIENT, SP_NEEDS_LOGIN, SP_CONNECTING, SP_CONNECTED, SP_ERROR };
+SpState g_spState = SP_NEEDS_CLIENT;
+String g_clientId, g_spUser, g_spMsg;
+String g_pkceVerifier, g_pkceNonce, g_authCode;
+volatile bool g_authPending = false;
+
+// --- Firmware updates from GitHub releases ---
+enum UpdState : uint8_t { UPD_IDLE, UPD_CHECKING, UPD_LATEST, UPD_AVAILABLE, UPD_INSTALLING, UPD_ERROR, UPD_DONE };
+UpdState g_updState = UPD_IDLE;
+String g_updLatest, g_updUrl, g_updMsg;
+volatile int g_updProgress = 0;
+volatile bool g_updCheckReq = false, g_updInstallReq = false;
+
+volatile uint32_t g_resetHoldMs = 0;   // how long BOOT has been held (for the on-screen countdown)
 
 static void lock() { xSemaphoreTake(mux, portMAX_DELAY); }
 static void unlock() { xSemaphoreGive(mux); }
@@ -158,7 +192,12 @@ static void setStatus(const char* s) {
   lock();
   strlcpy(g_status, s, sizeof(g_status));
   unlock();
-  Serial.println(s);
+  LOG.println(s);
+}
+
+static void logMem(const char* tag) {
+  LOG.printf("mem %-14s free %6u  largest %6u  min %6u\n", tag, (unsigned)ESP.getFreeHeap(),
+             (unsigned)ESP.getMaxAllocHeap(), (unsigned)ESP.getMinFreeHeap());
 }
 
 static uint32_t positionOf(const TrackInfo& t, uint32_t now) {
@@ -352,8 +391,7 @@ static void deriveDefault(ArtSet& s) {
   s.accent = rgb565(110, 230, 170);
 }
 
-static void deriveArt(ArtSet& s) {
-  const uint16_t* a = s.art;
+static void deriveArt(ArtSet& s, const uint16_t* a) {
   // 1) background colour grid: average each cell, then darken
   const int cell = ART / GRID;
   for (int gy = 0; gy < GRID; gy++)
@@ -434,18 +472,18 @@ static int httpGetToFile(const String& url, const char* path, int* bytes, const 
   if (code == 200) {
     File f = LittleFS.open(path, "w");
     if (!f) {
-      Serial.printf("%s: can't open %s\n", tag, path);
+      LOG.printf("%s: can't open %s\n", tag, path);
       code = -10;
     } else {
       int n = http.writeToStream(&f);
       f.close();
-      if (n < 0) { Serial.printf("%s: download error %d\n", tag, n); code = -11; }
+      if (n < 0) { LOG.printf("%s: download error %d\n", tag, n); code = -11; }
       else *bytes = n;
     }
   } else if (code < 0) {
     char err[100] = "";
     client.lastError(err, sizeof(err));
-    Serial.printf("%s: HTTP %d %s (heap %u, largest %u)\n", tag, code, err, (unsigned)ESP.getFreeHeap(),
+    LOG.printf("%s: HTTP %d %s (heap %u, largest %u)\n", tag, code, err, (unsigned)ESP.getFreeHeap(),
                   (unsigned)ESP.getMaxAllocHeap());
   }
   http.end();   // TLS memory is freed here
@@ -460,12 +498,21 @@ static bool decodeArtFile(ArtSet& dst) {
   const int scales[] = { 8, 4, 2 };
   for (int sc : scales) if (w / sc >= ART && h / sc >= ART) { scale = sc; break; }
   TJpgDec.setJpgScale(scale);
-  memset(dst.art, 0, ART * ART * 2);
-  g_decodeTarget = dst.art;
+  // Decode into the screen canvas (the caller holds the lock, so nothing is
+  // drawing), derive colours/thumbnail, then keep the pixels in flash: the
+  // full-size art only lives in RAM while the album-art view draws it.
+  uint16_t* px = canvas.getBuffer();
+  memset(px, 0, ART * ART * 2);
+  g_decodeTarget = px;
   int ox = ((int)(w / scale) - ART) / 2, oy = ((int)(h / scale) - ART) / 2;  // centre crop
   JRESULT r = TJpgDec.drawFsJpg(-ox, -oy, "/art.jpg", LittleFS);
-  if (r != JDR_OK) { Serial.printf("art: jpeg decode failed (%d)\n", (int)r); return false; }
-  deriveArt(dst);
+  if (r != JDR_OK) { LOG.printf("art: jpeg decode failed (%d)\n", (int)r); return false; }
+  deriveArt(dst, px);
+  File f = LittleFS.open("/art.raw", "w");
+  bool saved = f && f.write((const uint8_t*)px, ART * ART * 2) == (size_t)(ART * ART * 2);
+  if (f) f.close();
+  if (!saved) LOG.println("art: couldn't save to flash");
+  dst.has = saved;
   return true;
 }
 
@@ -474,56 +521,79 @@ static void fetchArt(const String& url) {
   uint32_t t0 = millis();
   int bytes = 0;
   bool ok = false;
-  if (url.length() == 0) Serial.println("art: no image url");
+  if (url.length() == 0) LOG.println("art: no image url");
   else ok = httpGetToFile(url, "/art.jpg", &bytes, "art") == 200 && bytes > 0;
   uint32_t t1 = millis();
   lock();
   bool dec = ok && decodeArtFile(g_art[0]);
   if (!dec) deriveDefault(g_art[0]);
+  g_artVersion++;
   unlock();
-  Serial.printf("art: %s, %d bytes, download %ums, decode %ums\n", dec ? "OK" : "FAILED", bytes,
+  LOG.printf("art: %s, %d bytes, download %ums, decode %ums\n", dec ? "OK" : "FAILED", bytes,
                 (unsigned)(t1 - t0), (unsigned)(millis() - t1));
 }
 
-static bool refreshAccessToken(int* httpCode) {
+// POST to Spotify's token endpoint (PKCE: client_id in the body, no secret).
+// Returns the HTTP code; on 200 `out` holds the JSON answer, otherwise `err`
+// holds Spotify's error code (e.g. "invalid_grant") and description.
+static int spotifyTokenRequest(const String& body, JsonDocument& out, String& err) {
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
   http.useHTTP10(true);
   http.setTimeout(10000);
-  if (!http.begin(client, "https://accounts.spotify.com/api/token")) return false;
+  if (!http.begin(client, "https://accounts.spotify.com/api/token")) return -1;
   http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-  http.addHeader("Authorization", String("Basic ") + base64::encode(String(SPOTIFY_CLIENT_ID) + ":" + SPOTIFY_CLIENT_SECRET));
-  int code = http.POST(String("grant_type=refresh_token&refresh_token=") + urlEncode(g_refreshToken));
-  *httpCode = code;
-  String body = http.getString();
-  http.end();
-  if (code != 200) {
-    Serial.printf("token refresh failed %d: %s\n", code, body.c_str());
-    if (code < 0) {
-      char err[120] = "";
-      client.lastError(err, sizeof(err));
-      IPAddress ip;
-      bool dns = WiFi.hostByName("accounts.spotify.com", ip);
-      Serial.printf("  tls: %s | dns: %s %s | free heap %u, largest block %u | rssi %d\n", err,
-                    dns ? "ok" : "FAILED", ip.toString().c_str(), (unsigned)ESP.getFreeHeap(),
-                    (unsigned)ESP.getMaxAllocHeap(), (int)WiFi.RSSI());
-    }
-    return false;
+  int code = http.POST(body);
+  String resp = code > 0 ? http.getString() : String();
+  if (code < 0) {
+    char e[100] = "";
+    client.lastError(e, sizeof(e));
+    err = String("connection failed: ") + e;
   }
+  http.end();
   JsonDocument doc;
-  if (deserializeJson(doc, body)) return false;
-  const char* at = doc["access_token"];
-  if (!at) return false;
-  g_accessToken = at;
+  if (resp.length() && !deserializeJson(doc, resp)) {
+    if (code == 200) out = doc;
+    else err = String(doc["error"] | "error") + ": " + String(doc["error_description"] | "");
+  }
+  return code;
+}
+
+static void setSpotify(SpState st, const String& msg) {
+  lock();
+  g_spState = st;
+  g_spMsg = msg;
+  unlock();
+  if (msg.length()) LOG.printf("Spotify: %s\n", msg.c_str());
+}
+
+static void storeTokens(JsonDocument& doc) {
+  g_accessToken = doc["access_token"] | "";
   uint32_t exp = doc["expires_in"] | 3600;
   g_tokenExpires = millis() + (exp > 300 ? exp - 120 : exp) * 1000UL;
   const char* rt = doc["refresh_token"];
-  if (rt && *rt && g_refreshToken != rt) {   // Spotify may rotate the refresh token
+  if (rt && *rt && g_refreshToken != rt) {   // PKCE refresh tokens rotate: keep the newest
     g_refreshToken = rt;
-    prefs.putString("rt", g_refreshToken);
+    Settings::setSpotifyRefreshToken(g_refreshToken);
   }
-  Serial.println("Spotify access token refreshed");
+}
+
+static bool refreshAccessToken(int* httpCode) {
+  String cid;
+  lock(); cid = g_clientId; unlock();
+  JsonDocument doc;
+  String err;
+  int code = spotifyTokenRequest(String("grant_type=refresh_token&refresh_token=") + urlEncode(g_refreshToken) +
+                                 "&client_id=" + urlEncode(cid), doc, err);
+  *httpCode = code;
+  if (code != 200 || !doc["access_token"].is<const char*>()) {
+    LOG.printf("token refresh failed %d: %s (heap %u, largest %u)\n", code, err.c_str(),
+               (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+    return false;
+  }
+  storeTokens(doc);
+  LOG.println("Spotify access token refreshed");
   return true;
 }
 
@@ -531,15 +601,72 @@ static bool ensureToken() {
   if (g_accessToken.length() && (int32_t)(millis() - g_tokenExpires) < 0) return true;
   int code = 0;
   if (refreshAccessToken(&code)) return true;
+  if (code == 400 || code == 401) {   // the login was revoked or expired: ask the user to connect again
+    g_refreshToken = "";
+    g_accessToken = "";
+    Settings::clearSpotifyLogin();
+    setSpotify(SP_NEEDS_LOGIN, "Spotify login expired. Please connect again.");
+    return false;
+  }
   bool showing;
   lock(); showing = g_statusMode || !g_track.active; unlock();
   if (showing) {
-    if (code == 400) setStatus("Spotify login rejected. Re-run get_spotify_token.py");
-    else if (code > 0) setStatus("Spotify login failed. Retrying...");
-    else setStatus("Can't reach Spotify. Retrying...");
+    setStatus(code > 0 ? "Spotify login failed. Retrying..." : "Can't reach Spotify. Retrying...");
     lock(); g_statusMode = true; unlock();
   }
   return false;
+}
+
+// Turn the one-time code from the login redirect into tokens.
+static void exchangeAuthCode() {
+  String code, verifier, cid;
+  lock();
+  code = g_authCode;
+  verifier = g_pkceVerifier;
+  cid = g_clientId;
+  g_authPending = false;
+  g_authCode = "";
+  unlock();
+  LOG.println("Spotify: finishing login");
+  JsonDocument doc;
+  String err;
+  int http = spotifyTokenRequest(String("grant_type=authorization_code&code=") + urlEncode(code) +
+                                 "&redirect_uri=" + urlEncode(SPOTIFY_REDIRECT_URI) + "&client_id=" + urlEncode(cid) +
+                                 "&code_verifier=" + urlEncode(verifier), doc, err);
+  if (http != 200 || !doc["refresh_token"].is<const char*>()) {
+    setSpotify(SP_ERROR, http > 0 ? "Spotify refused the login (" + err + "). Please try again."
+                                  : "Couldn't reach Spotify (" + err + "). Please try again.");
+    return;
+  }
+  g_refreshToken = "";
+  storeTokens(doc);
+
+  // who is this? (just for the web page)
+  String user;
+  {
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient h;
+    h.useHTTP10(true);
+    h.setTimeout(8000);
+    if (h.begin(client, "https://api.spotify.com/v1/me")) {
+      h.addHeader("Authorization", String("Bearer ") + g_accessToken);
+      if (h.GET() == 200) {
+        JsonDocument f, me;
+        f["display_name"] = true;
+        f["id"] = true;
+        if (!deserializeJson(me, h.getStream(), DeserializationOption::Filter(f)))
+          user = me["display_name"] | (me["id"] | "");
+      }
+      h.end();
+    }
+  }
+  Settings::setSpotifyUser(user);
+  lock(); g_spUser = user; unlock();
+  setSpotify(SP_CONNECTED, "");
+  LOG.printf("Spotify: connected as %s\n", user.c_str());
+  lock(); g_statusMode = true; strlcpy(g_status, "Talking to Spotify...", sizeof(g_status)); unlock();
+  g_forcePoll = true;
 }
 
 // --- LRCLIB ---
@@ -551,7 +678,7 @@ static int lrclibGet(const String& url, JsonDocument& doc, JsonDocument& filter)
     DeserializationError err = f ? deserializeJson(doc, f, DeserializationOption::Filter(filter))
                                  : DeserializationError(DeserializationError::InvalidInput);
     if (f) f.close();
-    if (err) { Serial.printf("lyrics: json %s (%d bytes)\n", err.c_str(), bytes); code = -2; }
+    if (err) { LOG.printf("lyrics: json %s (%d bytes)\n", err.c_str(), bytes); code = -2; }
   }
   return code;
 }
@@ -631,14 +758,14 @@ static void pollSpotify(uint32_t& backoffUntil) {
     int ra = http.header("Retry-After").toInt();
     http.end();
     backoffUntil = millis() + (uint32_t)max(ra, 5) * 1000UL;
-    Serial.printf("rate limited, waiting %ds\n", max(ra, 5));
+    LOG.printf("rate limited, waiting %ds\n", max(ra, 5));
     return;
   }
   if (code != 200) {
     char err[100] = "";
     client.lastError(err, sizeof(err));
     http.end();
-    Serial.printf("poll: HTTP %d %s (heap %u, largest %u)\n", code, err, (unsigned)ESP.getFreeHeap(),
+    LOG.printf("poll: HTTP %d %s (heap %u, largest %u)\n", code, err, (unsigned)ESP.getFreeHeap(),
                   (unsigned)ESP.getMaxAllocHeap());
     backoffUntil = millis() + 5000;
     return;
@@ -657,7 +784,7 @@ static void pollSpotify(uint32_t& backoffUntil) {
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
   http.end();
-  if (err) { Serial.printf("spotify json: %s\n", err.c_str()); return; }
+  if (err) { LOG.printf("spotify json: %s\n", err.c_str()); return; }
 
   JsonObject item = doc["item"];
   if (item.isNull()) { setNothingPlaying(); return; }   // ad, podcast, etc.
@@ -720,7 +847,7 @@ static void pollSpotify(uint32_t& backoffUntil) {
   unlock();
 
   if (!changed) return;
-  Serial.printf("Now playing: %s - %s  (detected %.1fs into the song)\n", artists.c_str(), title.c_str(),
+  LOG.printf("Now playing: %s - %s  (detected %.1fs into the song)\n", artists.c_str(), title.c_str(),
                 progress / 1000.0f);
 
   // album art -> back buffer, then swap
@@ -729,7 +856,7 @@ static void pollSpotify(uint32_t& backoffUntil) {
   // lyrics
   std::vector<LyricLine> lines;
   LyricsState st = fetchLyrics(primaryArtist, title, album, duration, lines);
-  Serial.printf("Lyrics: %s (%u lines)\n", st == LYR_SYNCED ? "synced" : "not found", (unsigned)lines.size());
+  LOG.printf("Lyrics: %s (%u lines)\n", st == LYR_SYNCED ? "synced" : "not found", (unsigned)lines.size());
   lock();
   if (strcmp(g_track.id, id.c_str()) == 0) {
     std::swap(g_lyrics, lines);
@@ -739,30 +866,218 @@ static void pollSpotify(uint32_t& backoffUntil) {
   unlock();
 }
 
+// ---------------------------------------------------------------- updates --
+static void checkUpdate() {
+  lock(); g_updState = UPD_CHECKING; unlock();
+  int bytes = 0;
+  int code = httpGetToFile(String("https://api.github.com/repos/") + GITHUB_REPO + "/releases/latest", "/rel.json",
+                           &bytes, "update");
+  String tag, url, msg;
+  if (code == 200) {
+    JsonDocument filter, doc;
+    filter["tag_name"] = true;
+    filter["assets"][0]["name"] = true;
+    filter["assets"][0]["browser_download_url"] = true;
+    File f = LittleFS.open("/rel.json", "r");
+    if (f && !deserializeJson(doc, f, DeserializationOption::Filter(filter))) {
+      tag = doc["tag_name"] | "";
+      for (JsonObject a : doc["assets"].as<JsonArray>())
+        if (String(a["name"] | "") == "firmware.bin") url = a["browser_download_url"] | "";
+    }
+    if (f) f.close();
+    if (tag.length() == 0) msg = "Couldn't read the latest release.";
+    else if (url.length() == 0) msg = "Release " + tag + " has no firmware.bin (still building?).";
+  } else if (code == 404) {
+    msg = "No releases published yet.";
+  } else {
+    msg = "Couldn't check for updates (HTTP " + String(code) + ").";
+  }
+  lock();
+  g_updLatest = tag;
+  g_updUrl = url;
+  g_updMsg = msg;
+  if (msg.length()) g_updState = UPD_ERROR;
+  else g_updState = (tag == FW_VERSION) ? UPD_LATEST : UPD_AVAILABLE;
+  unlock();
+  LOG.printf("Update check: installed %s, latest %s %s\n", FW_VERSION, tag.length() ? tag.c_str() : "?", msg.c_str());
+}
+
+static void installUpdate() {
+  String url, tag;
+  lock();
+  url = g_updUrl;
+  tag = g_updLatest;
+  if (url.length()) { g_updState = UPD_INSTALLING; g_updProgress = 0; }
+  unlock();
+  if (url.length() == 0) return;
+  LOG.printf("Installing update %s ...\n", tag.c_str());
+  WiFiClientSecure client;
+  client.setInsecure();
+  httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  httpUpdate.rebootOnUpdate(false);
+  httpUpdate.onProgress([](int cur, int total) { g_updProgress = total > 0 ? (int)((int64_t)cur * 100 / total) : 0; });
+  t_httpUpdate_return r = httpUpdate.update(client, url);
+  if (r == HTTP_UPDATE_OK) {
+    lock(); g_updState = UPD_DONE; g_updProgress = 100; unlock();
+    LOG.printf("Update %s installed, restarting\n", tag.c_str());
+    delay(2500);
+    ESP.restart();
+  }
+  String err = httpUpdate.getLastErrorString();
+  lock(); g_updState = UPD_ERROR; g_updMsg = "Update failed: " + err; unlock();
+  LOG.printf("Update failed: %s\n", err.c_str());
+}
+
+// ------------------------------------------------------------------ Wi-Fi --
+static void rebuildWifiMulti() {
+  auto list = Settings::wifiList();
+  delete g_wifiMulti;
+  g_wifiMulti = new WiFiMulti();
+  std::vector<String> names;
+  for (auto& w : list) {
+    g_wifiMulti->addAP(w.ssid.c_str(), w.pass.c_str());
+    names.push_back(w.ssid);
+  }
+  lock(); g_savedSsids = names; unlock();
+  LOG.printf("Saved Wi-Fi networks: %u\n", (unsigned)names.size());
+}
+
+static void startHotspot() {
+  if (g_hotspot) return;
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(SETUP_AP_NAME);
+  webSetCaptivePortal(true);
+  g_hotspotOffAt = 0;
+  g_hotspot = true;
+  logMem("hotspot on");
+  LOG.printf("Setup hotspot \"%s\" on, open http://%s\n", SETUP_AP_NAME, WiFi.softAPIP().toString().c_str());
+}
+
+static void stopHotspot() {
+  if (!g_hotspot) return;
+  webSetCaptivePortal(false);
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  g_hotspot = false;
+  g_setupDone = false;
+  LOG.println("Setup hotspot off");
+  logMem("hotspot off");
+}
+
+static void onWifiConnected() {
+  static bool timeSet = false;
+  strlcpy(g_ipStr, WiFi.localIP().toString().c_str(), sizeof(g_ipStr));
+  LOG.printf("WiFi OK: %s, IP %s, signal %d dBm\n", WiFi.SSID().c_str(), g_ipStr, (int)WiFi.RSSI());
+  if (!timeSet) { configTzTime(TIMEZONE, "pool.ntp.org", "time.google.com"); timeSet = true; }
+  // Keep the hotspot a little longer only if a phone is on it (to show the "you're connected" page).
+  if (g_hotspot) g_hotspotOffAt = millis() + (WiFi.softAPgetStationNum() > 0 ? 180000 : 1);
+  g_wifiUp = true;
+  logMem("wifi up");
+  setStatus("Talking to Spotify...");
+  g_forcePoll = true;
+}
+
+// The web page asked to join a network: try it, and save it only if it works.
+static void handleWifiTry() {
+  String ssid, pass;
+  lock();
+  ssid = g_trySsid;
+  pass = g_tryPass;
+  g_tryPass = "";
+  g_tryPending = false;
+  g_tryState = TRY_TRYING;
+  unlock();
+
+  if (WiFi.status() == WL_CONNECTED && WiFi.SSID() != ssid) {
+    // Already online elsewhere: switching would cut off the web page, so just save it.
+    Settings::addWifi(ssid, pass);
+    rebuildWifiMulti();
+    lock(); g_tryState = TRY_OK; g_tryMsg = ""; unlock();
+    LOG.printf("WiFi: saved %s (used when it's the strongest known network)\n", ssid.c_str());
+    return;
+  }
+  LOG.printf("WiFi: trying %s\n", ssid.c_str());
+  setStatus("Joining Wi-Fi...");
+  WiFi.disconnect(false);
+  delay(100);
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  wl_status_t st = WL_IDLE_STATUS;
+  for (int i = 0; i < 75; i++) {   // up to 15 s
+    st = WiFi.status();
+    if (st == WL_CONNECTED || st == WL_CONNECT_FAILED || st == WL_NO_SSID_AVAIL) break;
+    vTaskDelay(pdMS_TO_TICKS(200));
+  }
+  if (st == WL_CONNECTED) {
+    Settings::addWifi(ssid, pass);
+    rebuildWifiMulti();
+    lock(); g_tryState = TRY_OK; g_tryMsg = ""; unlock();
+    onWifiConnected();
+    return;
+  }
+  String msg = st == WL_NO_SSID_AVAIL ? "Network not found. Is it 2.4 GHz and in range?"
+                                      : "Couldn't connect. Is the password right?";
+  WiFi.disconnect(false);
+  lock(); g_tryState = TRY_FAIL; g_tryMsg = msg; unlock();
+  LOG.printf("WiFi: %s failed (%d): %s\n", ssid.c_str(), (int)st, msg.c_str());
+}
+
+// --------------------------------------------------------------- the task --
 static void netTask(void*) {
-  uint32_t lastPoll = 0, backoffUntil = 0;
+  uint32_t lastPoll = 0, backoffUntil = 0, lastWifiTry = 0, lastUpdCheck = 0;
+  int wifiFails = 0;
+  rebuildWifiMulti();
   for (;;) {
+    uint32_t now = millis();
+
+    // ---- Wi-Fi ----
+    if (g_tryPending) { handleWifiTry(); continue; }
+    if (g_wifiListChanged) { g_wifiListChanged = false; rebuildWifiMulti(); }
     if (WiFi.status() != WL_CONNECTED) {
-      static bool everConnected = false;
-      static int fails = 0;
-      if (fails < 3) setStatus(everConnected ? "WiFi lost. Reconnecting..." : "Looking for WiFi...");
-      lock(); g_statusMode = true; unlock();
-      // scans, then joins the strongest network from config.h
-      if (wifiMulti.run(10000) == WL_CONNECTED) {
-        Serial.printf("WiFi OK: %s, IP %s, signal %d dBm\n", WiFi.SSID().c_str(),
-                      WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
-        if (!everConnected) configTzTime(TIMEZONE, "pool.ntp.org", "time.google.com");
-        everConnected = true;
-        fails = 0;
-        setStatus("Talking to Spotify...");
-        g_forcePoll = true;
-      } else if (++fails >= 3) {
-        setStatus("No known WiFi found. Check config.h (2.4 GHz only)");
-        vTaskDelay(pdMS_TO_TICKS(2000));
+      if (g_wifiUp) { g_wifiUp = false; LOG.println("WiFi lost"); lastWifiTry = 0; }
+      size_t known;
+      lock(); known = g_savedSsids.size(); unlock();
+      if (known == 0) {                        // nothing saved yet: setup mode
+        startHotspot();
+        vTaskDelay(pdMS_TO_TICKS(200));
+        continue;
       }
+      // With the hotspot on, retry less often so the web page's own scans work.
+      uint32_t gap = g_hotspot ? 30000 : 3000;
+      if ((lastWifiTry == 0 || now - lastWifiTry > gap) && WiFi.scanComplete() != WIFI_SCAN_RUNNING) {
+        lastWifiTry = now;
+        if (!g_hotspot) {
+          setStatus(wifiFails ? "Looking for WiFi..." : "Connecting to WiFi...");
+          lock(); g_statusMode = true; unlock();
+        }
+        if (g_wifiMulti->run(10000) == WL_CONNECTED) {
+          wifiFails = 0;
+          onWifiConnected();
+        } else if (++wifiFails >= 4) {
+          startHotspot();                      // ~1 minute without Wi-Fi: let the user fix it from a phone
+        }
+      }
+      vTaskDelay(pdMS_TO_TICKS(100));
       continue;
     }
-    uint32_t now = millis();
+    if (!g_wifiUp) { wifiFails = 0; onWifiConnected(); }
+    if (g_hotspot && (g_setupDone || (g_hotspotOffAt && (int32_t)(now - g_hotspotOffAt) > 0) ||
+                      (g_hotspotOffAt && WiFi.softAPgetStationNum() == 0)))
+      stopHotspot();
+
+    // ---- requests from the web page ----
+    if (g_authPending) { exchangeAuthCode(); continue; }
+    if (g_updInstallReq) { g_updInstallReq = false; installUpdate(); continue; }
+    if (!g_hotspot && (g_updCheckReq || (lastUpdCheck == 0 && now > 60000) || now - lastUpdCheck > 12UL * 3600 * 1000)) {
+      g_updCheckReq = false;
+      lastUpdCheck = now ? now : 1;
+      checkUpdate();
+      continue;
+    }
+
+    // ---- Spotify ----
+    SpState sp;
+    lock(); sp = g_spState; unlock();
+    if (sp != SP_CONNECTED) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }
     if ((int32_t)(now - backoffUntil) < 0) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }
     bool playing;
     lock(); playing = g_track.active && g_track.playing; unlock();
@@ -772,6 +1087,177 @@ static void netTask(void*) {
     lastPoll = now;
     pollSpotify(backoffUntil);
   }
+}
+
+// ============================================================================
+//                       WEB PAGE  <->  DEVICE  (device.h)
+// ============================================================================
+static String randomString(size_t n) {
+  static const char* chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+  String s;
+  for (size_t i = 0; i < n; i++) s += chars[esp_random() % 66];
+  return s;
+}
+
+static String base64url(const uint8_t* d, size_t n) {
+  static const char* t = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  String o;
+  for (size_t i = 0; i < n; i += 3) {
+    uint32_t v = (uint32_t)d[i] << 16 | (i + 1 < n ? (uint32_t)d[i + 1] << 8 : 0) | (i + 2 < n ? d[i + 2] : 0);
+    o += t[(v >> 18) & 63];
+    o += t[(v >> 12) & 63];
+    if (i + 1 < n) o += t[(v >> 6) & 63];
+    if (i + 2 < n) o += t[v & 63];
+  }
+  return o;
+}
+
+void deviceStatus(JsonDocument& d) {
+  uint32_t now = millis();
+  bool up = WiFi.status() == WL_CONNECTED;
+  d["version"] = FW_VERSION;
+  d["uptime"] = now / 1000;
+  d["heap"] = ESP.getFreeHeap();
+  d["host"] = String(DEVICE_HOSTNAME) + ".local";
+  d["hotspot"] = (bool)g_hotspot;
+  lock();
+  JsonObject w = d["wifi"].to<JsonObject>();
+  w["connected"] = up;
+  if (up) {
+    w["ssid"] = WiFi.SSID();
+    w["ip"] = WiFi.localIP().toString();
+    w["rssi"] = WiFi.RSSI();
+  }
+  JsonArray saved = w["saved"].to<JsonArray>();
+  for (auto& n : g_savedSsids) saved.add(n);
+  static const char* tryNames[] = { "idle", "trying", "ok", "fail" };
+  w["tryState"] = tryNames[g_tryState];
+  w["trySsid"] = g_trySsid;
+  w["tryMsg"] = g_tryMsg;
+
+  JsonObject sp = d["spotify"].to<JsonObject>();
+  static const char* spNames[] = { "needs_client", "needs_login", "connecting", "connected", "error" };
+  sp["state"] = spNames[g_spState];
+  sp["clientId"] = g_clientId;
+  sp["user"] = g_spUser;
+  sp["msg"] = g_spMsg;
+  sp["redirectUri"] = SPOTIFY_REDIRECT_URI;
+
+  JsonObject np = d["now"].to<JsonObject>();
+  np["active"] = g_track.active && g_spState == SP_CONNECTED;
+  np["playing"] = g_track.playing;
+  np["title"] = g_track.title;
+  np["artist"] = g_track.artist;
+  np["pos"] = positionOf(g_track, now);
+  np["dur"] = g_track.durationMs;
+  static const char* lyrNames[] = { "none", "loading", "synced", "not found", "instrumental" };
+  np["lyrics"] = lyrNames[g_lyrState];
+  np["art"] = g_artVersion;
+
+  JsonObject u = d["update"].to<JsonObject>();
+  static const char* updNames[] = { "idle", "checking", "latest", "available", "installing", "error", "done" };
+  u["state"] = updNames[g_updState];
+  u["latest"] = g_updLatest;
+  u["progress"] = (int)g_updProgress;
+  u["msg"] = g_updMsg;
+  unlock();
+}
+
+void deviceTryWifi(const String& ssid, const String& pass) {
+  lock();
+  g_trySsid = ssid;
+  g_tryPass = pass;
+  g_tryState = TRY_TRYING;
+  g_tryMsg = "";
+  unlock();
+  g_tryPending = true;
+}
+
+void deviceRemoveWifi(const String& ssid) {
+  if (Settings::removeWifi(ssid)) LOG.printf("WiFi: removed %s\n", ssid.c_str());
+  g_wifiListChanged = true;
+}
+
+void deviceSetupDone() { g_setupDone = true; }
+bool deviceHotspotActive() { return g_hotspot; }
+
+void deviceSetSpotifyClientId(const String& id) {
+  Settings::setSpotifyClientId(id);
+  lock();
+  bool changed = g_clientId != id;
+  g_clientId = id;
+  if (changed || g_spState == SP_NEEDS_CLIENT) { g_spState = SP_NEEDS_LOGIN; g_spMsg = ""; }
+  unlock();
+  LOG.println("Spotify: Client ID saved");
+}
+
+String deviceSpotifyLoginUrl(const String& deviceBaseUrl) {
+  String cid;
+  lock(); cid = g_clientId; unlock();
+  if (cid.length() == 0) return "";
+  String verifier = randomString(64);
+  uint8_t hash[32];
+  SHA256Builder sha;
+  sha.begin();
+  sha.add((const uint8_t*)verifier.c_str(), verifier.length());
+  sha.calculate();
+  sha.getBytes(hash);
+  String nonce = randomString(16);
+  lock();
+  g_pkceVerifier = verifier;
+  g_pkceNonce = nonce;
+  unlock();
+  LOG.println("Spotify: login started from the web page");
+  return String("https://accounts.spotify.com/authorize?response_type=code&client_id=") + urlEncode(cid) +
+         "&redirect_uri=" + urlEncode(SPOTIFY_REDIRECT_URI) +
+         "&scope=" + urlEncode("user-read-currently-playing user-read-playback-state") +
+         "&code_challenge_method=S256&code_challenge=" + base64url(hash, 32) +
+         "&state=" + urlEncode(nonce + "|" + deviceBaseUrl);
+}
+
+bool deviceSpotifyCallback(const String& code, const String& state, const String& error, String& msg) {
+  String nonce;
+  lock(); nonce = g_pkceNonce; unlock();
+  if (error.length()) msg = error == "access_denied" ? "The Spotify login was cancelled." : "Spotify said: " + error;
+  else if (nonce.length() == 0 || !state.startsWith(nonce + "|")) msg = "This login link has expired. Click Connect Spotify again.";
+  else if (code.length() == 0) msg = "Spotify didn't send a login code. Please try again.";
+  if (msg.length()) { setSpotify(SP_ERROR, msg); return false; }
+  lock();
+  g_authCode = code;
+  g_pkceNonce = "";
+  g_spState = SP_CONNECTING;
+  g_spMsg = "";
+  unlock();
+  g_authPending = true;
+  return true;
+}
+
+void deviceSpotifyLogout() {
+  Settings::clearSpotifyLogin();
+  lock();
+  g_spUser = "";
+  g_spState = g_clientId.length() ? SP_NEEDS_LOGIN : SP_NEEDS_CLIENT;
+  g_spMsg = "";
+  g_track.active = false;
+  unlock();
+  LOG.println("Spotify: disconnected");
+}
+
+void deviceCheckUpdate() { g_updCheckReq = true; }
+void deviceInstallUpdate() { g_updInstallReq = true; }
+
+void deviceRestart() {
+  LOG.println("Restarting...");
+  delay(200);
+  ESP.restart();
+}
+
+void deviceReset(const String& what) {
+  LOG.printf("Reset requested: %s\n", what.c_str());
+  if (what == "wifi") Settings::clearWifi();
+  else if (what == "spotify") Settings::clearSpotifyLogin();
+  else Settings::factoryReset();
+  deviceRestart();
 }
 
 // ============================================================================
@@ -1074,8 +1560,13 @@ static void drawNoteIcon(int cx, int cy, uint16_t c) {
 }
 
 static void drawArtView(const TrackInfo& t, const ArtSet& a, uint32_t pos, uint32_t now) {
-  if (a.has) memcpy(fb(), a.art, W * H * 2);
-  else { drawBackground(a, now); drawNoteIcon(64, 44, scale565(a.accent, 200)); }
+  bool loaded = false;
+  if (a.has) {
+    File f = LittleFS.open("/art.raw", "r");
+    loaded = f && f.read((uint8_t*)fb(), W * H * 2) == (size_t)(W * H * 2);
+    if (f) f.close();
+  }
+  if (!loaded) { drawBackground(a, now); drawNoteIcon(64, 44, scale565(a.accent, 200)); }
 
   // smooth dark gradient at the bottom so the text is readable on any cover
   for (int y = 58; y < H; y++) {
@@ -1127,10 +1618,9 @@ static void drawIdle(const ArtSet& a, uint32_t now) {
   drawCentered(108, "Nothing playing", FONT_SUB, 0x9CF3);
 }
 
+static const ArtSet& defaultArt();
 static void drawStatus(const char* msg, uint32_t now) {
-  static ArtSet def;
-  static bool init = false;
-  if (!init) { deriveDefault(def); init = true; }
+  const ArtSet& def = defaultArt();
   drawBackground(def, now);
   // spinner
   for (int k = 0; k < 8; k++) {
@@ -1166,13 +1656,111 @@ static void pushFrame() {
   tft.drawRGBBitmap(0, 0, fb(), W, H);
 }
 
+// ---------------------------------------------------------- QR code + setup screens --
+static char s_qrText[96] = "";
+static uint8_t s_qrSize = 0;
+static uint8_t s_qr[41 * 41];
+
+static void qrCapture(esp_qrcode_handle_t q) {
+  int n = esp_qrcode_get_size(q);
+  if (n > 41) n = 0;
+  s_qrSize = n;
+  for (int y = 0; y < n; y++)
+    for (int x = 0; x < n; x++) s_qr[y * n + x] = esp_qrcode_get_module(q, x, y) ? 1 : 0;
+}
+
+// Draw a QR code centred at the top. Returns the y just below it.
+static int drawQR(const char* text, int top, int scale) {
+  if (strcmp(text, s_qrText) != 0) {
+    strlcpy(s_qrText, text, sizeof(s_qrText));
+    s_qrSize = 0;
+    esp_qrcode_config_t cfg = {};
+    cfg.display_func = qrCapture;
+    cfg.max_qrcode_version = 6;
+    cfg.qrcode_ecc_level = ESP_QRCODE_ECC_LOW;
+    esp_qrcode_generate(&cfg, text);
+  }
+  if (!s_qrSize) return top;
+  int px = s_qrSize * scale, quiet = 2 * scale;
+  int x0 = (W - px) / 2, y0 = top + quiet;
+  fillRectD(x0 - quiet, top, px + 2 * quiet, px + 2 * quiet, WHITE);
+  for (int y = 0; y < s_qrSize; y++)
+    for (int x = 0; x < s_qrSize; x++)
+      if (s_qr[y * s_qrSize + x]) fillRectD(x0 + x * scale, y0 + y * scale, scale, scale, BLACK);
+  return top + px + 2 * quiet;
+}
+
+static const ArtSet& defaultArt() {
+  static ArtSet def;
+  static bool init = false;
+  if (!init) { deriveDefault(def); init = true; }
+  return def;
+}
+
+// Hotspot is on and there's no Wi-Fi: scan the QR to join the setup hotspot.
+static void drawSetupScreen(uint32_t now, bool knownNetworks) {
+  drawBackground(defaultArt(), now);
+  char wifiQr[80];
+  snprintf(wifiQr, sizeof(wifiQr), "WIFI:T:nopass;S:%s;;", SETUP_AP_NAME);
+  int y = drawQR(wifiQr, 4, 2);
+  drawCentered(y + 11, knownNetworks ? "Wi-Fi not found" : "Scan to set up", FONT_TITLE, WHITE);
+  drawCentered(y + 22, "or join Wi-Fi:", FONT_SUB, 0xBDF7);
+  drawCentered(y + 33, SETUP_AP_NAME, FONT_SUB, defaultArt().accent);
+  drawCentered(y + 44, "open 192.168.4.1", FONT_SUB, 0xBDF7);
+}
+
+// On Wi-Fi but Spotify isn't connected: show where the web page is.
+static void drawConnectSpotify(uint32_t now, const String& msg) {
+  drawBackground(defaultArt(), now);
+  char url[48];
+  snprintf(url, sizeof(url), "http://%s/", g_ipStr);
+  int y = drawQR(url, 4, 2);
+  drawCentered(y + 11, msg.length() ? "Reconnect Spotify" : "Connect Spotify", FONT_TITLE, WHITE);
+  drawCentered(y + 22, "open in a browser:", FONT_SUB, 0xBDF7);
+  char host[32];
+  snprintf(host, sizeof(host), "%s.local", DEVICE_HOSTNAME);
+  drawCentered(y + 33, host, FONT_SUB, defaultArt().accent);
+  drawCentered(y + 44, g_ipStr, FONT_SUB, 0xBDF7);
+}
+
+static void drawUpdating(uint32_t now) {
+  drawBackground(defaultArt(), now);
+  drawCentered(48, "Updating", FONT_LYRIC, WHITE);
+  int p = g_updProgress;
+  int x = 14, w = W - 28;
+  tintRect(x, 62, w, 6, WHITE, 50);
+  fillRectD(x, 62, w * p / 100, 6, defaultArt().accent);
+  char buf[24];
+  snprintf(buf, sizeof(buf), g_updState == UPD_DONE ? "Done! Restarting" : "%d%%", p);
+  drawCentered(84, buf, FONT_SUB, 0xDEFB);
+  drawCentered(108, "Don't unplug me", FONT_SUB, 0x9CF3);
+}
+
+static void drawResetHold(uint32_t held) {
+  darkenRect(0, 0, W, H, 60);
+  char buf[32];
+  int left = (int)((10000 - (int)min(held, (uint32_t)10000)) + 999) / 1000;
+  drawCentered(50, "Factory reset", FONT_LYRIC, WHITE);
+  snprintf(buf, sizeof(buf), left > 0 ? "keep holding: %d" : "resetting...", left);
+  drawCentered(70, buf, FONT_SUB, 0xFBEF);
+  drawCentered(92, "release to cancel", FONT_SUB, 0x9CF3);
+}
+
 static void renderFrame(uint32_t now, float dt) {
   bool active;
   lock();
   TrackInfo t = g_track;
   const ArtSet& a = g_art[g_artFront];
   active = t.active;
-  if (g_statusMode) {
+  SpState sp = g_spState;
+  bool wifiUp = g_wifiUp;
+  if (g_updState == UPD_INSTALLING || g_updState == UPD_DONE) {
+    drawUpdating(now);
+  } else if (g_hotspot && !wifiUp) {
+    drawSetupScreen(now, !g_savedSsids.empty());
+  } else if (wifiUp && (sp == SP_NEEDS_CLIENT || sp == SP_NEEDS_LOGIN || sp == SP_ERROR)) {
+    drawConnectSpotify(now, g_spMsg);
+  } else if (g_statusMode) {
     char msg[96];
     strlcpy(msg, g_status, sizeof(msg));
     drawStatus(msg, now);
@@ -1189,12 +1777,14 @@ static void renderFrame(uint32_t now, float dt) {
       g_forcePoll = true;
     }
   }
+  if (g_resetHoldMs > 1500) drawResetHold(g_resetHoldMs);
+  pushFrame();   // inside the lock: the album-art decoder borrows the canvas
   unlock();
-  pushFrame();
 
   // backlight
   static int bl = 0;
-  int target = (active || g_statusMode || now - g_lastActiveMs < IDLE_DIM_AFTER_MS) ? BRIGHTNESS_ACTIVE : BRIGHTNESS_IDLE;
+  bool busy = active || g_statusMode || g_hotspot || sp != SP_CONNECTED || g_updState == UPD_INSTALLING;
+  int target = (busy || now - g_lastActiveMs < IDLE_DIM_AFTER_MS) ? BRIGHTNESS_ACTIVE : BRIGHTNESS_IDLE;
   if (bl != target) {
     bl += (target > bl) ? min(8, target - bl) : -min(4, bl - target);
 #if TFT_BL >= 0
@@ -1211,20 +1801,28 @@ static void renderFrame(uint32_t now, float dt) {
 //                              SETUP / LOOP
 // ============================================================================
 static void handleButton(uint32_t now) {
-  static bool last = HIGH;
-  static uint32_t tChange = 0;
-  bool v = digitalRead(BUTTON_PIN);
-  if (v != last && now - tChange > 40) {
-    tChange = now;
-    last = v;
-    if (v == LOW) { g_preferArt = !g_preferArt; g_snapScroll = true; }
+  static bool down = false;
+  static uint32_t tDown = 0;
+  bool pressed = digitalRead(BUTTON_PIN) == LOW;
+  if (pressed && !down) { down = true; tDown = now; }
+  else if (!pressed && down) {
+    down = false;
+    if (now - tDown < 1000) { g_preferArt = !g_preferArt; g_snapScroll = true; }   // short press
+  }
+  g_resetHoldMs = down ? now - tDown : 0;
+  if (down && now - tDown >= 10000) {
+    LOG.println("BOOT held 10 s: factory reset");
+    renderFrame(now, FRAME_MS);
+    Settings::factoryReset();
+    delay(800);
+    ESP.restart();
   }
 }
 
 void setup() {
-  Serial.begin(115200);
+  LOG.begin(115200);
   delay(100);
-  Serial.println("\nSpotify Now Playing display");
+  LOG.printf("\nSpotify Now Playing display %s\n", FW_VERSION);
   mux = xSemaphoreCreateMutex();
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
@@ -1246,37 +1844,34 @@ void setup() {
   u8f.setFontDirection(0);
 
   // allocate the two album-art buffers early, before WiFi fragments the heap
-  g_art[0].art = (uint16_t*)malloc(ART * ART * 2);   // one buffer: TLS needs the RAM
   deriveDefault(g_art[0]);
-  if (!canvas.getBuffer() || !g_art[0].art) {
-    Serial.println("Not enough RAM for buffers!");
+  if (!canvas.getBuffer()) {
+    LOG.println("Not enough RAM for buffers!");
     while (true) delay(1000);
   }
-  if (!LittleFS.begin(true)) Serial.println("LittleFS mount failed (album art disabled)");
+  logMem("buffers");
+  if (!LittleFS.begin(true)) LOG.println("LittleFS mount failed (album art disabled)");
   TJpgDec.setSwapBytes(false);
   TJpgDec.setCallback(jpgOut);
 
-  // refresh token: the newest one Spotify gave us is kept in flash
-  prefs.begin("spotify", false);
-  if (prefs.getString("seed", "") != SPOTIFY_REFRESH_TOKEN) {
-    prefs.putString("seed", SPOTIFY_REFRESH_TOKEN);
-    prefs.putString("rt", SPOTIFY_REFRESH_TOKEN);
-  }
-  g_refreshToken = prefs.getString("rt", SPOTIFY_REFRESH_TOKEN);
+  // settings saved through the web page
+  Settings::begin();
+  g_clientId = Settings::spotifyClientId();
+  g_refreshToken = Settings::spotifyRefreshToken();
+  g_spUser = Settings::spotifyUser();
+  g_spState = g_clientId.isEmpty() ? SP_NEEDS_CLIENT : (g_refreshToken.isEmpty() ? SP_NEEDS_LOGIN : SP_CONNECTED);
+  LOG.printf("Firmware %s, Spotify: %s\n", FW_VERSION,
+             g_spState == SP_CONNECTED ? "logged in" : (g_spState == SP_NEEDS_LOGIN ? "not logged in" : "no Client ID"));
 
-  if (strlen(SPOTIFY_CLIENT_ID) == 0 || strlen(SPOTIFY_CLIENT_SECRET) == 0 || g_refreshToken.length() == 0) {
-    strlcpy(g_status, "Add your Spotify keys to config.h (see README.md)", sizeof(g_status));
-    for (;;) { uint32_t now = millis(); renderFrame(now, FRAME_MS); delay(FRAME_MS); }
-  }
-
-  // WiFi: register every known network; the network task connects to the strongest one
+  logMem("settings");
+  WiFi.persistent(false);   // we keep the networks ourselves (settings.cpp)
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
-  for (const WifiNet& n : WIFI_LIST) {
-    wifiMulti.addAP(n.ssid, n.pass);
-    Serial.printf("Known WiFi: %s\n", n.ssid);
-  }
-  strlcpy(g_status, "Looking for WiFi...", sizeof(g_status));
+  WiFi.setHostname(DEVICE_HOSTNAME);
+  strlcpy(g_status, "Connecting to WiFi...", sizeof(g_status));
+  logMem("wifi init");
+  webBegin();
+  logMem("web server");
   xTaskCreatePinnedToCore(netTask, "net", 16384, nullptr, 1, nullptr, 0);
 }
 
