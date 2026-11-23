@@ -22,39 +22,24 @@ Unplug the ESP32 from USB first.
 - The **BOOT** button on the ESP32 board toggles between the lyrics view and the album-art view. You don't need to wire anything for it.
 - Keep the jumper wires short (under 15 cm) for a clean picture.
 
-## 2. Arduino IDE
+## 2. Install the firmware (once, over USB)
 
 1. Install **Arduino IDE 2** from arduino.cc.
-2. **Boards Manager**: search `esp32` and install **esp32 by Espressif Systems**.
+2. **Boards Manager**: search `esp32` and install **esp32 by Espressif Systems** (version 4.0.0).
 3. **Library Manager**: install all of these:
    - `Adafruit ST7735 and ST7789 Library` (accept "Install all" so it adds Adafruit GFX + BusIO)
    - `U8g2_for_Adafruit_GFX` (by olikraus)
    - `ArduinoJson` (by Benoit Blanchon, version 7.x)
    - `TJpg_Decoder` (by Bodmer)
+4. Open `SpotifyLyricsDisplay.ino` and set:
+   - **Tools → Board**: ESP32 Dev Module
+   - **Tools → Partition Scheme**: **Minimal SPIFFS (1.9MB APP with OTA)**. The sketch's own `partitions.csv` is used automatically; this setting only sets the size check.
+   - **Tools → Port**: your ESP32
+5. Click **Upload**. If it hangs at `Connecting....`, hold the BOOT button until the upload starts.
 
-## 3. Test the screen
+After this first upload, new versions install over Wi-Fi from the web page (see *Updates*).
 
-Open `SpotifyLyricsDisplay.ino` and set your WiFi in `config.h`. Leave the Spotify fields empty for now. You can list several networks: the display joins the strongest one it knows and switches automatically if it drops (2.4 GHz only):
-
-```c
-struct WifiNet { const char* ssid; const char* pass; };
-static const WifiNet WIFI_LIST[] = {
-  { "home-wifi",     "password" },
-  { "phone-hotspot", "password" },
-};
-```
-
-Then set:
-
-- **Tools → Board**: ESP32 Dev Module
-- **Tools → Partition Scheme**: **Huge APP (3MB No OTA/1MB SPIFFS)**. The default scheme is too small for this sketch.
-- **Tools → Port**: your ESP32
-
-Click **Upload**. If it hangs at `Connecting....`, hold the BOOT button until the upload starts.
-
-You should see an animated spinner, then the message *"Add your Spotify keys to config.h"*. That means the wiring works.
-
-If the picture looks wrong:
+If the picture looks wrong, change `config.h` and upload again:
 
 | Symptom                                  | Fix in `config.h`                                 |
 |------------------------------------------|---------------------------------------------------|
@@ -64,42 +49,68 @@ If the picture looks wrong:
 | Red and blue swapped                     | `TFT_SWAP_RB 1`                                   |
 | Upside down / sideways                   | `TFT_ROTATION` 1, 2 or 3                          |
 
-## 4. Spotify keys (one time)
+## 3. Connect to Wi-Fi
 
-1. Go to https://developer.spotify.com/dashboard, log in, and click **Create app**.
-   - Name/description: anything
-   - **Redirect URI**: `http://127.0.0.1:8888/callback` (exactly this, then click **Add**)
-   - Under APIs, tick **Web API**, then **Save**.
-2. Open the app's **Settings** and copy the **Client ID**. Click **View client secret** and copy that too.
-3. On your Mac, run the helper:
-   ```bash
-   python3 tools/get_spotify_token.py
-   ```
-   Paste the Client ID and Secret. A browser opens: click **Agree**.
-4. The script prints three `#define` lines. Paste them over the empty ones in `config.h`.
-5. Set `TIMEZONE` in `config.h` (examples are listed there) so the idle clock is right.
-6. Upload again.
+With no Wi-Fi saved, the display starts a setup hotspot and shows a QR code.
+
+1. Scan the QR code with your phone (or join the Wi-Fi **Lyrics-Display-Setup**, no password).
+2. The setup page opens by itself (otherwise browse to **192.168.4.1**). Tap **Get started**.
+3. Pick your network, enter the password and tap **Connect** (2.4 GHz networks only).
+
+You can save several networks later; the display joins the strongest one it knows. If none of them is found for about a minute, the setup hotspot comes back so you can fix it from your phone.
+
+## 4. Connect Spotify
+
+The screen now shows a QR code and the address of the display's web page: **http://lyrics.local** (or the IP address it shows). Open it from a phone or computer on the same Wi-Fi.
+
+1. Go to https://developer.spotify.com/dashboard and create an app (any name, tick **Web API**).
+2. In the app's **Settings → Edit**, add this **Redirect URI** and save:
+   `https://alexmoen955.github.io/spotify-lyrics-display/`
+3. Copy the app's **Client ID** into the web page and click **Save**. (No Client Secret is needed.)
+4. Click **Connect Spotify** and then **Agree**. You come back to the display's page, logged in.
+
+The redirect URI is a tiny page in this repository (`docs/index.html`, served by GitHub Pages). Spotify only sends logins to secure `https` pages, so this page forwards the login back to your display on your own network. It stores nothing.
 
 ## 5. Use it
 
 Play something on Spotify on any device. Within a few seconds the screen shows:
 
-- **Lyrics view** (when synced lyrics exist): a blurred background in the album's colours that drifts slowly, a thumbnail of the art, the title and artist (long ones scroll), a progress bar in the album's accent colour, and lyrics that glide upward. The current line shows in bright white. Instrumental gaps show three dots that fill up.
-- **Album-art view** (press BOOT, or automatic when a song has no synced lyrics): the full cover with title, artist, a progress bar and times.
+- **Lyrics view** (when synced lyrics exist): a blurred background in the album's colours that drifts slowly, a thumbnail of the art, the title and artist (long ones scroll), a progress bar in the album's accent colour, and lyrics that glide upward with the current line lighting up word by word. Instrumental gaps show three dots that fill up.
+- **Album-art view** (press BOOT, or automatic when a song has no synced lyrics): the full cover with title, artist and a progress bar.
 - **Idle**: a clock and date. The backlight dims after 2 minutes.
 
 Lyrics come from **LRCLIB** (lrclib.net), a free community database. Most popular songs have them; some don't.
 
+## The web page (http://lyrics.local)
+
+- **Now playing**: cover, title, progress and whether lyrics were found
+- **Spotify**: connected account, disconnect
+- **Wi-Fi**: current network and signal, saved networks, add or remove networks
+- **Updates**: check for and install new versions
+- **Live logs**: everything the display does, in real time (pause, download)
+- **Device**: restart, forget Wi-Fi, reset Spotify, factory reset
+
+**Factory reset without the web page:** hold the BOOT button for 10 seconds.
+
+## Updates
+
+Pushing a version tag (for example `v2.1.0`) runs the GitHub Actions workflow in `.github/workflows/release.yml`. It builds the firmware and attaches `firmware.bin` to the GitHub release. The display checks for new releases twice a day; click **Install update** on the web page to install one. Wi-Fi and Spotify settings are kept.
+
 ## Tweaks (`config.h`)
 
+`config.h` holds no passwords: Wi-Fi and the Spotify login are stored on the ESP32 itself.
+
 - `LYRICS_LEAD_MS`: raise it if lyrics appear late, lower it if they appear early.
+- `WORD_HIGHLIGHT`, `WORD_MS_PER_CHAR`: word-by-word highlighting on/off and its speed.
+- `TIMEZONE`: for the idle clock (examples in the file).
 - `POLL_INTERVAL_MS`: how often to ask Spotify (2.5 s by default; don't go below ~1.5 s or you'll be rate-limited).
 
 ## Troubleshooting
 
-Open **Tools → Serial Monitor** at 115200 baud. Every step is logged there.
+The **Live logs** on the web page show every step (or use **Tools → Serial Monitor** at 115200 baud over USB).
 
-- *"Spotify login rejected"*: the refresh token is wrong or was revoked. Run the helper again.
-- *"WiFi failed"*: the ESP32 only works on 2.4 GHz networks.
+- *Spotify shows "INVALID_CLIENT: Invalid redirect URI"*: the redirect URI from step 4 isn't saved in your Spotify app.
+- *"Spotify login expired"*: click **Connect Spotify** again on the web page.
+- *Can't open lyrics.local*: use the IP address shown on the screen (some Android phones don't support `.local` names).
 - Non-Latin lyrics (Japanese, Korean, Cyrillic…) won't render, because the built-in fonts only cover Western European characters.
 - Podcasts and ads show the idle screen.

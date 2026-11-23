@@ -742,9 +742,10 @@ static void pollSpotify(uint32_t& backoffUntil) {
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
-  http.useHTTP10(true);
+  http.setReuse(false);
   http.setTimeout(8000);
-  if (!http.begin(client, "https://api.spotify.com/v1/me/player/currently-playing")) return;
+  // market=from_token drops the long "available_markets" lists: ~4x smaller answer
+  if (!http.begin(client, "https://api.spotify.com/v1/me/player/currently-playing?market=from_token")) return;
   const char* keys[] = { "Retry-After" };
   http.collectHeaders(keys, 1);
   http.addHeader("Authorization", String("Bearer ") + g_accessToken);
@@ -781,10 +782,16 @@ static void pollSpotify(uint32_t& backoffUntil) {
   filter["item"]["album"]["name"] = true;
   filter["item"]["album"]["images"][0]["url"] = true;
   filter["item"]["album"]["images"][0]["width"] = true;
-  JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+  // getString() reads the whole body correctly whether it is chunked or not
+  String body = http.getString();
   http.end();
-  if (err) { LOG.printf("spotify json: %s\n", err.c_str()); return; }
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, body, DeserializationOption::Filter(filter));
+  if (err) {
+    LOG.printf("spotify json: %s (%u bytes, heap %u)\n", err.c_str(), (unsigned)body.length(), (unsigned)ESP.getFreeHeap());
+    backoffUntil = millis() + 1000;
+    return;
+  }
 
   JsonObject item = doc["item"];
   if (item.isNull()) { setNothingPlaying(); return; }   // ad, podcast, etc.
