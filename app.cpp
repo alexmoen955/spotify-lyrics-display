@@ -20,7 +20,7 @@
 #include <WiFiMulti.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
-#include <HTTPUpdate.h>
+#include <Update.h>
 #include <LittleFS.h>
 #include <SHA2Builder.h>
 #include <esp_random.h>
@@ -909,30 +909,109 @@ static void checkUpdate() {
   LOG.printf("Update check: installed %s, latest %s %s\n", FW_VERSION, tag.length() ? tag.c_str() : "?", msg.c_str());
 }
 
+// GitHub answers release downloads with a redirect to its file servers.
+// Returns the final URL (or the same one if there is no redirect).
+static String resolveRedirect(const String& url, int* httpCode) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.useHTTP10(true);
+  http.setTimeout(15000);
+  http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+  http.setUserAgent(USER_AGENT);
+  if (!http.begin(client, url)) return "";
+  const char* keys[] = { "Location" };
+  http.collectHeaders(keys, 1);
+  int code = http.GET();
+  *httpCode = code;
+  String loc = http.header("Location");
+  http.end();
+  if (code == 200) return url;
+  if (code >= 300 && code < 400 && loc.length()) return loc;
+  return "";
+}
+
+static void updateFailed(const String& why) {
+  lock(); g_updState = UPD_ERROR; g_updMsg = "Update failed: " + why; unlock();
+  LOG.printf("Update failed: %s (heap %u, largest %u)\n", why.c_str(), (unsigned)ESP.getFreeHeap(),
+             (unsigned)ESP.getMaxAllocHeap());
+}
+
 static void installUpdate() {
   String url, tag;
   lock();
   url = g_updUrl;
   tag = g_updLatest;
   if (url.length()) { g_updState = UPD_INSTALLING; g_updProgress = 0; }
+  g_lyrics.clear();          // free a little RAM for the download
+  g_lyrics.shrink_to_fit();
+  g_lyrVersion++;
   unlock();
   if (url.length() == 0) return;
-  LOG.printf("Installing update %s ...\n", tag.c_str());
+  LOG.printf("Installing update %s\n", tag.c_str());
+  logMem("update start");
+
+  int code = 0;
+  String finalUrl = resolveRedirect(url, &code);
+  if (finalUrl.length() == 0) { updateFailed("GitHub answered HTTP " + String(code)); return; }
+  int hostEnd = finalUrl.indexOf('/', 8);
+  LOG.printf("update: downloading from %s\n", finalUrl.substring(8, hostEnd > 0 ? hostEnd : 40).c_str());
+
   WiFiClientSecure client;
   client.setInsecure();
-  httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  httpUpdate.rebootOnUpdate(false);
-  httpUpdate.onProgress([](int cur, int total) { g_updProgress = total > 0 ? (int)((int64_t)cur * 100 / total) : 0; });
-  t_httpUpdate_return r = httpUpdate.update(client, url);
-  if (r == HTTP_UPDATE_OK) {
-    lock(); g_updState = UPD_DONE; g_updProgress = 100; unlock();
-    LOG.printf("Update %s installed, restarting\n", tag.c_str());
-    delay(2500);
-    ESP.restart();
+  HTTPClient http;
+  http.useHTTP10(true);
+  http.setTimeout(20000);
+  http.setUserAgent(USER_AGENT);
+  if (!http.begin(client, finalUrl)) { updateFailed("bad download address"); return; }
+  code = http.GET();
+  if (code != 200) {
+    char err[100] = "";
+    client.lastError(err, sizeof(err));
+    http.end();
+    updateFailed("download HTTP " + String(code) + " " + err);
+    return;
   }
-  String err = httpUpdate.getLastErrorString();
-  lock(); g_updState = UPD_ERROR; g_updMsg = "Update failed: " + err; unlock();
-  LOG.printf("Update failed: %s\n", err.c_str());
+  int total = http.getSize();
+  if (total <= 0) { http.end(); updateFailed("unknown file size"); return; }
+  if (!Update.begin(total, U_FLASH)) { http.end(); updateFailed(String("no room: ") + Update.errorString()); return; }
+  LOG.printf("update: %d bytes\n", total);
+
+  auto* stream = http.getStreamPtr();
+  uint8_t buf[1024];
+  int done = 0, lastPct = -1;
+  uint32_t last = millis();
+  while (done < total && millis() - last < 20000) {
+    size_t avail = stream->available();
+    if (avail) {
+      int n = stream->readBytes(buf, min(avail, sizeof(buf)));
+      if (n > 0) {
+        if ((int)Update.write(buf, n) != n) break;
+        done += n;
+        last = millis();
+        int pct = (int)((int64_t)done * 100 / total);
+        g_updProgress = pct;
+        if (pct / 10 != lastPct / 10) { lastPct = pct; LOG.printf("update: %d%%\n", pct); }
+      }
+    } else if (!stream->connected()) {
+      break;
+    } else {
+      delay(2);
+    }
+  }
+  http.end();
+  if (done != total) {
+    String why = Update.hasError() ? String("flash write: ") + Update.errorString()
+                                   : "download stopped at " + String(done * 100 / total) + "%";
+    Update.abort();
+    updateFailed(why);
+    return;
+  }
+  if (!Update.end(true)) { updateFailed(String("check failed: ") + Update.errorString()); return; }
+  lock(); g_updState = UPD_DONE; g_updProgress = 100; unlock();
+  LOG.printf("Update %s installed, restarting\n", tag.c_str());
+  delay(2500);
+  ESP.restart();
 }
 
 // ------------------------------------------------------------------ Wi-Fi --
